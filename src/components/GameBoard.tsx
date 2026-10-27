@@ -1,0 +1,1475 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import React, { useEffect, useRef, useState, useCallback } from 'react';
+import confetti from 'canvas-confetti';
+import {
+  BALL_RADIUS_BELT,
+  BALL_RADIUS_FUNNEL,
+  BALL_SPACING,
+  BALLS_PER_BLOCK,
+  BASE_HEIGHT,
+  BASE_WIDTH,
+  BELT_CAPACITY,
+  BELT_SPEED,
+  BRICK_COLUMNS_X,
+  BRICK_HOLE_OFFSETS,
+  BRICK_HOLES,
+  BRICK_STACK_PITCH,
+  BRICK_TOP_HEIGHT,
+  BRICK_TOP_Y,
+  BRICK_WIDTH,
+  CELL_RADIUS,
+  CELL_SIZE,
+  COLOR_CONFIG,
+  FUNNEL,
+  GLASS_CONTAINER,
+  GRID_COLS,
+  GRID_ROWS,
+  GRID_X_CENTERS,
+  GRID_Y_CENTERS,
+  THEME,
+} from '../game/constants';
+import {
+  FEED_POINT_S,
+  TOTAL_PATH_LEN,
+  circularDistance,
+  getBeltCoordinates,
+  isSOnBottomLane,
+} from '../game/beltPath';
+import { getLevel1, getLevel35, generateSolvableLevel } from '../game/levels';
+import { FunnelPhysics } from '../game/physics';
+import {
+  isExposed,
+  isLevelWon,
+  shouldBlockBlockTap,
+  tapCell,
+  tryMatchBeltBall,
+  updateGridAfterChange,
+} from '../game/rules';
+import { conveyorRenderer } from '../game/conveyorRenderer';
+import { sounds } from '../game/sound';
+import {
+  BeltBall,
+  BrickColumn,
+  DroppingBall,
+  GridCell,
+  LevelData,
+  MarbleColor,
+  Particle,
+} from '../game/types';
+import bgImageSrc from '../assets/images/royal_marble_frame.png';
+import coinRackImgSrc from '../assets/images/coin_rack.png';
+import pauseNormalImgSrc from '../assets/images/pause_normal.png';
+import pauseHoverImgSrc from '../assets/images/pause_hover.png';
+import pausePressedImgSrc from '../assets/images/pause_pressed.png';
+import bucketPurple from '../assets/images/buckets/bucket_purple.png';
+import bucketPink from '../assets/images/buckets/bucket_pink.png';
+import bucketIce from '../assets/images/buckets/bucket_ice.png';
+import bucketYellow from '../assets/images/buckets/bucket_yellow.png';
+import bucketLime from '../assets/images/buckets/bucket_lime.png';
+import bucketCyan from '../assets/images/buckets/bucket_cyan.png';
+import bucketOrange from '../assets/images/buckets/bucket_orange.png';
+import bucketRed from '../assets/images/buckets/bucket_red.png';
+import bucketsSheetClean from '../assets/images/buckets/buckets_sheet_clean.png';
+
+const ARENA_SHIFT_Y = -35;
+
+const COLOR_ROW_MAP: Record<MarbleColor, number> = {
+  purple: 0,
+  pink: 1,
+  ice: 2,
+  yellow: 3,
+  lime: 4,
+  cyan: 5,
+  orange: 6,
+  red: 7,
+};
+
+const BUCKET_COL_CENTERS = [
+  83.5, 228.0, 369.0, 509.0, 647.0, 784.5, 922.0, 1058.0, 1195.5, 1331.0, 1461.0,
+];
+
+interface GameBoardProps {
+  levelNumber?: number;
+}
+
+export const GameBoard: React.FC<GameBoardProps> = ({ levelNumber = 35 }) => {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  // High-level game state
+  const [currentLevel, setCurrentLevel] = useState<number>(levelNumber);
+  const [score, setScore] = useState<number>(0);
+  const [coins, setCoins] = useState<number>(2450);
+  const [gameState, setGameState] = useState<'playing' | 'won' | 'lost'>('playing');
+  const [isPaused, setIsPaused] = useState<boolean>(false);
+  const [pauseButtonState, setPauseButtonState] = useState<'normal' | 'hover' | 'pressed'>('normal');
+  const [soundMuted, setSoundMuted] = useState<boolean>(false);
+  const [powerupCounts, setPowerupCounts] = useState({
+    magnet: 1,
+    shuffle: 1,
+    gumball: 1,
+  });
+  const [, setImagesLoaded] = useState<boolean>(false);
+
+  // Current canvas viewport scale & offset in CSS pixels
+  const viewTransformRef = useRef({ scale: 1, offsetX: 0, offsetY: 0 });
+  const [hudTransform, setHudTransform] = useState({ scale: 1, offsetX: 0, offsetY: 0 });
+
+  useEffect(() => {
+    const updateLayout = () => {
+      const container = containerRef.current;
+      if (!container) return;
+      const rect = container.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return;
+      const scaleX = rect.width / BASE_WIDTH;
+      const scaleY = rect.height / BASE_HEIGHT;
+      const scale = Math.min(scaleX, scaleY);
+      const offsetX = (rect.width - BASE_WIDTH * scale) / 2;
+      const offsetY = (rect.height - BASE_HEIGHT * scale) / 2;
+      setHudTransform({ scale, offsetX, offsetY });
+    };
+
+    updateLayout();
+    window.addEventListener('resize', updateLayout);
+    return () => window.removeEventListener('resize', updateLayout);
+  }, []);
+
+  // Game references for requestAnimationFrame loop
+  const levelDataRef = useRef<LevelData>(getLevel35());
+  const gridRef = useRef<GridCell[][]>([]);
+  const columnsRef = useRef<BrickColumn[]>([]);
+  const physicsRef = useRef<FunnelPhysics>(new FunnelPhysics());
+  const beltBallsRef = useRef<BeltBall[]>([]);
+  const droppingBallsRef = useRef<DroppingBall[]>([]);
+  const particlesRef = useRef<Particle[]>([]);
+  const nextDropIdRef = useRef<number>(5000);
+  const beltScrollDistanceRef = useRef<number>(0);
+  const backlogLockedRef = useRef<boolean>(false);
+  const warningTimerRef = useRef<number>(0);
+  const bgImgRef = useRef<HTMLImageElement | null>(null);
+  const bucketImgsRef = useRef<Partial<Record<MarbleColor, HTMLImageElement>>>({});
+  const bucketsSheetRef = useRef<HTMLImageElement | null>(null);
+
+  useEffect(() => {
+    let loadedCount = 0;
+    const totalToLoad = 10;
+    const checkLoaded = () => {
+      loadedCount++;
+      if (loadedCount >= totalToLoad) {
+        setImagesLoaded(true);
+      }
+    };
+
+    const img = new Image();
+    img.onload = checkLoaded;
+    img.src = bgImageSrc;
+    if (img.complete) checkLoaded();
+    bgImgRef.current = img;
+
+    const sheet = new Image();
+    sheet.onload = checkLoaded;
+    sheet.src = bucketsSheetClean;
+    if (sheet.complete) checkLoaded();
+    bucketsSheetRef.current = sheet;
+
+    const colorImgMap: Record<MarbleColor, string> = {
+      purple: bucketPurple,
+      pink: bucketPink,
+      ice: bucketIce,
+      yellow: bucketYellow,
+      lime: bucketLime,
+      cyan: bucketCyan,
+      orange: bucketOrange,
+      red: bucketRed,
+    };
+
+    const loaded: Partial<Record<MarbleColor, HTMLImageElement>> = {};
+    for (const [c, src] of Object.entries(colorImgMap)) {
+      const bImg = new Image();
+      bImg.onload = checkLoaded;
+      bImg.src = src;
+      if (bImg.complete) checkLoaded();
+      loaded[c as MarbleColor] = bImg;
+    }
+    bucketImgsRef.current = loaded;
+  }, []);
+
+  // Initialize level
+  const initLevel = useCallback((lvl: number) => {
+    let data: LevelData;
+    if (lvl === 35) {
+      data = getLevel35();
+    } else if (lvl === 1) {
+      data = getLevel1();
+    } else {
+      data = generateSolvableLevel(lvl);
+    }
+
+    levelDataRef.current = data;
+    gridRef.current = data.grid.map((row) =>
+      row.map((cell) => ({
+        ...cell,
+        animState: 'idle',
+        animTimer: 0,
+        scaleX: 1,
+        scaleY: 1,
+        offsetY: 0,
+      }))
+    );
+
+    // Initial check for exposed states
+    for (let r = 0; r < GRID_ROWS; r++) {
+      for (let c = 0; c < GRID_COLS; c++) {
+        if (gridRef.current[r][c].kind === 'block' && isExposed(gridRef.current, r, c)) {
+          gridRef.current[r][c].animState = 'popBounced';
+          gridRef.current[r][c].animTimer = 1;
+        }
+      }
+    }
+
+    // Build brick columns
+    columnsRef.current = data.columns.map((colColors, i) => ({
+      x: BRICK_COLUMNS_X[i],
+      bricks: colColors.map((color) => ({
+        color,
+        filled: 0,
+        inFlight: 0,
+        animState: 'idle',
+        animTimer: 0,
+      })),
+      lastDropTime: 0,
+      shiftOffsetY: 0,
+    }));
+
+    physicsRef.current = new FunnelPhysics();
+    beltBallsRef.current = [];
+    droppingBallsRef.current = [];
+    particlesRef.current = [];
+    setGameState('playing');
+  }, []);
+
+  useEffect(() => {
+    initLevel(currentLevel);
+  }, [currentLevel, initLevel]);
+
+  // Audio toggle
+  const toggleSound = () => {
+    sounds.enabled = !sounds.enabled;
+    setSoundMuted(!sounds.enabled);
+  };
+
+  // Restart level
+  const handleRestart = () => {
+    sounds.playTap();
+    initLevel(currentLevel);
+  };
+
+  // Next level
+  const handleNextLevel = () => {
+    sounds.playTap();
+    const nextLvl = currentLevel === 1 ? 35 : currentLevel + 1;
+    setCurrentLevel(nextLvl);
+  };
+
+  // Power-up 1: Magnet
+  const useMagnet = () => {
+    if (powerupCounts.magnet <= 0 || gameState !== 'playing') return;
+    setPowerupCounts((p) => ({ ...p, magnet: p.magnet - 1 }));
+    sounds.playPowerup();
+
+    const topColors = new Map<MarbleColor, number>();
+    columnsRef.current.forEach((col, idx) => {
+      if (col.bricks.length > 0) {
+        topColors.set(col.bricks[0].color, idx);
+      }
+    });
+
+    const remainingBeltBalls: BeltBall[] = [];
+
+    for (const ball of beltBallsRef.current) {
+      const colIdx = topColors.get(ball.color);
+      if (colIdx !== undefined) {
+        const col = columnsRef.current[colIdx];
+        const topBrick = col.bricks[0];
+        if (topBrick && topBrick.filled + topBrick.inFlight < BRICK_HOLES) {
+          const targetHole = topBrick.filled + topBrick.inFlight;
+          topBrick.inFlight++;
+          const coords = getBeltCoordinates(ball.s);
+
+          droppingBallsRef.current.push({
+            id: nextDropIdRef.current++,
+            color: ball.color,
+            startX: coords.x,
+            startY: coords.y,
+            targetX: col.x + BRICK_HOLE_OFFSETS[targetHole],
+            targetY: BRICK_TOP_Y + 10,
+            progress: 0,
+            duration: 0.22,
+            colIndex: colIdx,
+            holeIndex: targetHole,
+          });
+          continue;
+        }
+      }
+      remainingBeltBalls.push(ball);
+    }
+
+    beltBallsRef.current = remainingBeltBalls;
+  };
+
+  // Power-up 2: Shuffle
+  const useShuffle = () => {
+    if (powerupCounts.shuffle <= 0 || gameState !== 'playing') return;
+    setPowerupCounts((p) => ({ ...p, shuffle: p.shuffle - 1 }));
+    sounds.playPowerup();
+
+    const normalBlocks: { r: number; c: number; color: MarbleColor }[] = [];
+    for (let r = 0; r < GRID_ROWS; r++) {
+      for (let c = 0; c < GRID_COLS; c++) {
+        if (gridRef.current[r][c].kind === 'block' && gridRef.current[r][c].color) {
+          normalBlocks.push({ r, c, color: gridRef.current[r][c].color! });
+        }
+      }
+    }
+
+    const colors = normalBlocks.map((b) => b.color);
+    for (let i = colors.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [colors[i], colors[j]] = [colors[j], colors[i]];
+    }
+
+    normalBlocks.forEach((b, idx) => {
+      gridRef.current[b.r][b.c].color = colors[idx];
+      gridRef.current[b.r][b.c].animState = 'popBounced';
+      gridRef.current[b.r][b.c].animTimer = 0;
+    });
+  };
+
+  // Power-up 3: Gumball
+  const useGumball = () => {
+    if (powerupCounts.gumball <= 0 || gameState !== 'playing') return;
+    setPowerupCounts((p) => ({ ...p, gumball: p.gumball - 1 }));
+    sounds.playPowerup();
+
+    columnsRef.current.forEach((col) => {
+      if (col.bricks.length > 0) {
+        col.bricks[0].animState = 'completing';
+        col.bricks[0].animTimer = 0;
+      }
+    });
+  };
+
+  // Pointer Interaction
+  const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const rect = canvas.getBoundingClientRect();
+    const rawX = e.clientX - rect.left;
+    const rawY = e.clientY - rect.top;
+
+    const { scale, offsetX, offsetY } = viewTransformRef.current;
+    const gameX = (rawX - offsetX) / scale;
+    const gameY = (rawY - offsetY) / scale;
+
+    // 0. HUD: Pause Button (in top-left red box area: x: ~16..56, y: ~4..48)
+    if (
+      (gameX >= 16 && gameX <= 56 && gameY >= 4 && gameY <= 48) ||
+      (rawX >= 10 && rawX <= 64 && rawY >= 4 && rawY <= 52)
+    ) {
+      setPauseButtonState('pressed');
+      sounds.playTap();
+      setIsPaused((p) => !p);
+      return;
+    }
+
+    if (isPaused || gameState !== 'playing') return;
+
+    // Arena coordinate space (accounting for vertical arena shift)
+    const arenaGameX = gameX;
+    const arenaGameY = gameY - ARENA_SHIFT_Y;
+
+    // Grid Blocks (r0..r5)
+    for (let r = 0; r < GRID_ROWS; r++) {
+      for (let c = 0; c < GRID_COLS; c++) {
+        const cx = GRID_X_CENTERS[c];
+        const cy = GRID_Y_CENTERS[r];
+        const halfW = 18;
+        const halfH = 17;
+
+        if (
+          arenaGameX >= cx - halfW &&
+          arenaGameX <= cx + halfW &&
+          arenaGameY >= cy - halfH &&
+          arenaGameY <= cy + halfH
+        ) {
+          const cell = gridRef.current[r][c];
+          if (cell.kind === 'block' && isExposed(gridRef.current, r, c)) {
+            // Check if funnel waiting backlog is locked (>= 45 balls waiting until < 40)
+            if (backlogLockedRef.current) {
+              sounds.playBlocked();
+              cell.animState = 'blocked';
+              cell.animTimer = 0;
+              return;
+            }
+
+            sounds.playTap();
+            cell.animState = 'pressed';
+            cell.animTimer = 0;
+
+            setTimeout(() => {
+              if (gridRef.current[r]?.[c]?.kind === 'block') {
+                const tapRes = tapCell(gridRef.current, r, c);
+                if (tapRes.tapped && tapRes.color) {
+                  sounds.playPopBurst();
+                  physicsRef.current.spawnBurst(cx, cy, tapRes.color, BALLS_PER_BLOCK);
+                  setScore((s) => s + 50);
+
+                  const changes = updateGridAfterChange(gridRef.current);
+                  if (changes.revealedCells.length > 0) {
+                    sounds.playTap();
+                  }
+                  if (changes.dispensedCells.length > 0) {
+                    sounds.playPopBurst();
+                  }
+                }
+              }
+            }, 80);
+            return;
+          }
+        }
+      }
+    }
+  };
+
+  const handlePointerUp = () => {
+    if (pauseButtonState === 'pressed') {
+      setPauseButtonState('normal');
+    }
+  };
+
+  const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const rect = canvas.getBoundingClientRect();
+    const rawX = e.clientX - rect.left;
+    const rawY = e.clientY - rect.top;
+
+    const { scale, offsetX, offsetY } = viewTransformRef.current;
+    const gameX = (rawX - offsetX) / scale;
+    const gameY = (rawY - offsetY) / scale;
+
+    if (
+      (gameX >= 16 && gameX <= 56 && gameY >= 4 && gameY <= 48) ||
+      (rawX >= 10 && rawX <= 64 && rawY >= 4 && rawY <= 52)
+    ) {
+      if (pauseButtonState !== 'pressed') {
+        setPauseButtonState('hover');
+      }
+    } else {
+      if (pauseButtonState === 'hover') {
+        setPauseButtonState('normal');
+      }
+    }
+  };
+
+  // Main Render Loop
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    let animationFrameId: number;
+    let lastTime = performance.now();
+
+    const loop = (currentTime: number) => {
+      const dt = Math.min((currentTime - lastTime) / 1000, 0.05);
+      lastTime = currentTime;
+
+      const rect = canvas.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) {
+        animationFrameId = requestAnimationFrame(loop);
+        return;
+      }
+
+      const dpr = window.devicePixelRatio || 1;
+      const displayW = Math.round(rect.width * dpr);
+      const displayH = Math.round(rect.height * dpr);
+
+      if (canvas.width !== displayW || canvas.height !== displayH) {
+        canvas.width = displayW;
+        canvas.height = displayH;
+      }
+
+      ctx.save();
+      // Apply DPR scaling
+      ctx.scale(dpr, dpr);
+
+      // Uniform scaling to fill width on mobile portrait
+      const scaleX = rect.width / BASE_WIDTH;
+      const scaleY = rect.height / BASE_HEIGHT;
+      const scale = Math.min(scaleX, scaleY);
+      const offsetX = (rect.width - BASE_WIDTH * scale) / 2;
+      const offsetY = (rect.height - BASE_HEIGHT * scale) / 2;
+
+      viewTransformRef.current = { scale, offsetX, offsetY };
+
+      // 1. Draw the Royal Marble Frame image covering 100% of the canvas end-to-end!
+      if (bgImgRef.current && bgImgRef.current.complete && bgImgRef.current.naturalWidth > 0) {
+        ctx.drawImage(bgImgRef.current, 0, 0, rect.width, rect.height);
+      } else {
+        ctx.fillStyle = '#10011E';
+        ctx.fillRect(0, 0, rect.width, rect.height);
+      }
+
+      ctx.translate(offsetX, offsetY + ARENA_SHIFT_Y * scale);
+      ctx.scale(scale, scale);
+
+      // ==========================================
+      // 1. GAME LOGIC TICK
+      // ==========================================
+      // Advance belt scroll distance continuously when not paused
+      if (!isPaused) {
+        beltScrollDistanceRef.current = (beltScrollDistanceRef.current + BELT_SPEED * dt) % TOTAL_PATH_LEN;
+      }
+      const slotSpacing = TOTAL_PATH_LEN / BELT_CAPACITY; // ~14.913px
+
+      if (!isPaused && gameState === 'playing') {
+        // Find which slot is currently under the feed point (FEED_POINT_S = 96)
+        let feedSlotIndex = -1;
+        let minFeedDist = Infinity;
+
+        for (let k = 0; k < BELT_CAPACITY; k++) {
+          const slotS = (k * slotSpacing + beltScrollDistanceRef.current) % TOTAL_PATH_LEN;
+          const dist = circularDistance(slotS, FEED_POINT_S);
+          if (dist < minFeedDist) {
+            minFeedDist = dist;
+            feedSlotIndex = k;
+          }
+        }
+
+        // Slot is eligible to receive a ball if it is directly below neck (dist < 4.5px) and empty
+        const occupiedSlotSet = new Set<number>(beltBallsRef.current.map((b) => b.slotIndex));
+        const canFeed =
+          feedSlotIndex !== -1 &&
+          minFeedDist <= 4.5 &&
+          !occupiedSlotSet.has(feedSlotIndex) &&
+          beltBallsRef.current.length < BELT_CAPACITY;
+
+        const fedBall = physicsRef.current.update(dt, canFeed);
+        if (fedBall && feedSlotIndex !== -1) {
+          sounds.playBallClink();
+          const targetS = (feedSlotIndex * slotSpacing + beltScrollDistanceRef.current) % TOTAL_PATH_LEN;
+          beltBallsRef.current.push({
+            id: fedBall.id,
+            color: fedBall.color,
+            slotIndex: feedSlotIndex,
+            s: targetS,
+            scale: 1.15,
+          });
+        }
+
+        // Advance each ball locked precisely to its designated moving slot (0..29)
+        for (const ball of beltBallsRef.current) {
+          ball.s = (ball.slotIndex * slotSpacing + beltScrollDistanceRef.current) % TOTAL_PATH_LEN;
+          if (ball.scale > 1.0) {
+            ball.scale = Math.max(1.0, ball.scale - dt * 2.5);
+          }
+        }
+
+        const matchedBeltBallIds = new Set<number>();
+        const nowMs = Date.now();
+
+        for (const ball of beltBallsRef.current) {
+          if (isSOnBottomLane(ball.s)) {
+            const coords = getBeltCoordinates(ball.s);
+            const match = tryMatchBeltBall(coords.x, ball.color, columnsRef.current, nowMs);
+
+            if (match) {
+              matchedBeltBallIds.add(ball.id);
+              const col = columnsRef.current[match.matchedColIndex];
+              const targetX = col.x + BRICK_HOLE_OFFSETS[match.targetHoleIndex];
+              const targetY = BRICK_TOP_Y + 10;
+
+              droppingBallsRef.current.push({
+                id: nextDropIdRef.current++,
+                color: ball.color,
+                startX: coords.x,
+                startY: coords.y,
+                targetX,
+                targetY,
+                progress: 0,
+                duration: 0.18,
+                colIndex: match.matchedColIndex,
+                holeIndex: match.targetHoleIndex,
+              });
+            }
+          }
+        }
+
+        if (matchedBeltBallIds.size > 0) {
+          beltBallsRef.current = beltBallsRef.current.filter((b) => !matchedBeltBallIds.has(b.id));
+        }
+
+        for (let i = droppingBallsRef.current.length - 1; i >= 0; i--) {
+          const drop = droppingBallsRef.current[i];
+          drop.progress += dt / drop.duration;
+
+          if (drop.progress >= 1.0) {
+            const col = columnsRef.current[drop.colIndex];
+            const topBrick = col.bricks[0];
+
+            if (topBrick) {
+              topBrick.inFlight = Math.max(0, topBrick.inFlight - 1);
+              topBrick.filled++;
+              sounds.playDropHole(topBrick.filled - 1);
+
+              if (topBrick.filled >= BRICK_HOLES && topBrick.animState !== 'completing') {
+                topBrick.animState = 'completing';
+                topBrick.animTimer = 0;
+                sounds.playBrickClear();
+                setScore((s) => s + 300);
+
+                for (let s = 0; s < 5; s++) {
+                  particlesRef.current.push({
+                    x: col.x + (Math.random() - 0.5) * 40,
+                    y: BRICK_TOP_Y + (Math.random() - 0.5) * 15,
+                    vx: (Math.random() - 0.5) * 80,
+                    vy: -40 - Math.random() * 60,
+                    color: '#FFFFFF',
+                    size: 4 + Math.random() * 4,
+                    alpha: 1,
+                    life: 0,
+                    maxLife: 0.4,
+                    shape: 'star',
+                  });
+                }
+              }
+            }
+
+            droppingBallsRef.current.splice(i, 1);
+          }
+        }
+
+        columnsRef.current.forEach((col) => {
+          if (col.bricks.length > 0) {
+            const top = col.bricks[0];
+            if (top.animState === 'completing') {
+              top.animTimer = (top.animTimer || 0) + dt;
+              if (top.animTimer >= 0.25) {
+                col.bricks.shift();
+                col.shiftOffsetY = BRICK_STACK_PITCH;
+              }
+            }
+          }
+
+          if (col.shiftOffsetY > 0) {
+            col.shiftOffsetY = Math.max(0, col.shiftOffsetY - dt * 90);
+          }
+        });
+
+        if (isLevelWon(columnsRef.current)) {
+          setGameState('won');
+          sounds.playWin();
+          confetti({
+            particleCount: 80,
+            spread: 70,
+            origin: { y: 0.6 },
+          });
+        }
+      }
+
+      for (let i = particlesRef.current.length - 1; i >= 0; i--) {
+        const p = particlesRef.current[i];
+        p.life += dt;
+        p.x += p.vx * dt;
+        p.y += p.vy * dt;
+        p.alpha = Math.max(0, 1 - p.life / p.maxLife);
+        if (p.life >= p.maxLife) {
+          particlesRef.current.splice(i, 1);
+        }
+      }
+
+      // Funnel backlog tracking & hysteresis state (locks at >= 45, unlocks at < 40)
+      const waitingCount = physicsRef.current.balls.length;
+      const wasLocked = backlogLockedRef.current;
+      const nowLocked = shouldBlockBlockTap(waitingCount, wasLocked);
+      if (!wasLocked && nowLocked) {
+        // Limit reached: play subtle indicator sound indicating balls cannot enter right now
+        sounds.playBlocked();
+      }
+      backlogLockedRef.current = nowLocked;
+
+      // ==========================================
+      // 2. CANVAS RENDERING
+      // ==========================================
+      renderGlassContainer(ctx);
+      renderFunnel(ctx);
+      // Conveyor belt renders the 30 sockets and nested marbles directly at (0, 0)
+      conveyorRenderer.render(ctx, beltScrollDistanceRef.current, currentTime, beltBallsRef.current);
+      renderBrickColumns(ctx, columnsRef.current);
+      renderGridBlocks(ctx, gridRef.current, dt);
+      renderFunnelBalls(ctx, physicsRef.current.balls);
+      renderDroppingBalls(ctx, droppingBallsRef.current);
+      renderParticles(ctx, particlesRef.current);
+      renderHint(ctx);
+
+      ctx.restore();
+
+      animationFrameId = requestAnimationFrame(loop);
+    };
+
+    animationFrameId = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(animationFrameId);
+  }, [gameState, isPaused, powerupCounts]);
+
+  // ==========================================
+  // CANVAS DRAWING IMPLEMENTATION
+  // ==========================================
+
+  const renderCanvasPowerups = (
+    ctx: CanvasRenderingContext2D,
+    counts: { magnet: number; shuffle: number; gumball: number }
+  ) => {
+    ctx.save();
+    drawPowerupBox(ctx, 62, 150, 48, 28, '🧲', counts.magnet);
+    drawPowerupBox(ctx, 124, 150, 48, 28, '🔀', counts.shuffle);
+    drawPowerupBox(ctx, 186, 150, 48, 28, '🔮', counts.gumball);
+    ctx.restore();
+  };
+
+  const drawPowerupBox = (
+    ctx: CanvasRenderingContext2D,
+    x: number,
+    y: number,
+    w: number,
+    h: number,
+    icon: string,
+    count: number
+  ) => {
+    const grad = ctx.createLinearGradient(x, y, x, y + h);
+    grad.addColorStop(0, '#32B558');
+    grad.addColorStop(1, '#1A7D3A');
+    ctx.fillStyle = grad;
+
+    ctx.beginPath();
+    ctx.roundRect(x, y, w, h, 8);
+    ctx.fill();
+
+    ctx.strokeStyle = THEME.goldBorder;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    ctx.font = '18px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(icon, x + w / 2, y + h / 2);
+
+    const badgeX = x + w - 3;
+    const badgeY = y + h - 3;
+    ctx.fillStyle = '#E93D5A';
+    ctx.beginPath();
+    ctx.arc(badgeX, badgeY, 7, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.strokeStyle = '#FFFFFF';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = 'bold 9px Fredoka, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(`${count}`, badgeX, badgeY + 1);
+  };
+
+  const renderGlassContainer = (ctx: CanvasRenderingContext2D) => {
+    const { x, y, width, height, topRadius } = GLASS_CONTAINER;
+
+    ctx.save();
+    // Translucent luxury crystalline glass gradient
+    const grad = ctx.createLinearGradient(x, y, x, y + height);
+    grad.addColorStop(0, 'rgba(255, 255, 255, 0.12)');
+    grad.addColorStop(0.4, 'rgba(85, 25, 145, 0.22)');
+    grad.addColorStop(1, 'rgba(35, 8, 70, 0.38)');
+    ctx.fillStyle = grad;
+
+    ctx.beginPath();
+    ctx.moveTo(x + topRadius, y);
+    ctx.lineTo(x + width - topRadius, y);
+    ctx.quadraticCurveTo(x + width, y, x + width, y + topRadius);
+    ctx.lineTo(x + width, y + height);
+    ctx.lineTo(x, y + height);
+    ctx.lineTo(x, y + topRadius);
+    ctx.quadraticCurveTo(x, y, x + topRadius, y);
+    ctx.closePath();
+    ctx.fill();
+
+    // Golden frame rim
+    ctx.strokeStyle = THEME.glassBorder;
+    ctx.lineWidth = 3;
+    ctx.stroke();
+
+    // Inner bright glass highlight rim
+    ctx.strokeStyle = THEME.glassInnerRim;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    // Stepped pyramid backdrop
+    ctx.fillStyle = THEME.gridBoardBg;
+    ctx.beginPath();
+    ctx.roundRect(147 - 40, 235, 80, 40, 8);
+    ctx.roundRect(147 - 75, 268, 150, 40, 8);
+    ctx.roundRect(147 - 110, 303, 220, 125, 10);
+    ctx.fill();
+
+    ctx.restore();
+  };
+
+  const renderFunnel = (ctx: CanvasRenderingContext2D) => {
+    ctx.save();
+    ctx.fillStyle = THEME.funnelFill;
+    ctx.beginPath();
+    ctx.moveTo(14, 432);
+    ctx.lineTo(FUNNEL.neckX1, FUNNEL.neckY1);
+    ctx.lineTo(FUNNEL.neckX1, FUNNEL.neckY2);
+    ctx.lineTo(FUNNEL.neckX2, FUNNEL.neckY2);
+    ctx.lineTo(FUNNEL.neckX2, FUNNEL.neckY1);
+    ctx.lineTo(282, 432);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.strokeStyle = THEME.funnelBorder;
+    ctx.lineWidth = 5;
+    ctx.lineJoin = 'round';
+    ctx.stroke();
+
+    ctx.restore();
+  };
+
+  const renderConveyorBelt = (ctx: CanvasRenderingContext2D) => {
+    ctx.save();
+
+    ctx.fillStyle = THEME.beltHousingFill;
+    ctx.beginPath();
+    ctx.roundRect(20, 490, 256, 56, 22);
+    ctx.fill();
+    ctx.strokeStyle = THEME.beltHousingBorder;
+    ctx.lineWidth = 3;
+    ctx.stroke();
+
+    ctx.fillStyle = THEME.beltTrack;
+    ctx.beginPath();
+    ctx.roundRect(28, 498, 240, 44, 22);
+    ctx.fill();
+    ctx.strokeStyle = THEME.beltRim;
+    ctx.lineWidth = 3;
+    ctx.stroke();
+
+    ctx.fillStyle = THEME.beltDivider;
+    ctx.beginPath();
+    ctx.roundRect(55, 518, 186, 5, 3);
+    ctx.fill();
+
+    ctx.fillStyle = THEME.beltSlot;
+    for (let i = 0; i < 14; i++) {
+      const sx = 58 + i * 13;
+      ctx.beginPath();
+      ctx.roundRect(sx, 502, 10, 12, 5);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.roundRect(sx, 526, 10, 12, 5);
+      ctx.fill();
+    }
+
+    ctx.restore();
+  };
+
+  const renderBrickColumns = (ctx: CanvasRenderingContext2D, columns: BrickColumn[]) => {
+    ctx.save();
+
+    columns.forEach((col) => {
+      const stack = col.bricks;
+      const count = stack.length;
+      if (count === 0) return;
+
+      const colX = col.x;
+      // Stacks extend to screen bottom (up to 5 bricks visible)
+      const visibleCount = Math.min(count, 5);
+
+      for (let i = visibleCount - 1; i >= 0; i--) {
+        const brick = stack[i];
+        const isTop = i === 0;
+        const config = COLOR_CONFIG[brick.color];
+
+        const baseY = BRICK_TOP_Y + i * BRICK_STACK_PITCH - col.shiftOffsetY;
+
+        let brickScale = 1.0;
+        let liftY = 0;
+        let alpha = 1.0;
+
+        if (isTop && brick.animState === 'completing') {
+          const t = Math.min((brick.animTimer || 0) / 0.25, 1.0);
+          brickScale = 1.0 + 0.12 * Math.sin(t * Math.PI);
+          liftY = -10 * t;
+          alpha = Math.max(0, 1.0 - t * 1.5);
+        }
+
+        ctx.save();
+        ctx.globalAlpha = alpha;
+        ctx.translate(colX, baseY + liftY);
+        ctx.scale(brickScale, brickScale);
+
+        ctx.fillStyle = isTop ? config.hex : config.dark;
+        ctx.beginPath();
+        ctx.roundRect(-BRICK_WIDTH / 2, 0, BRICK_WIDTH, BRICK_TOP_HEIGHT, 6);
+        ctx.fill();
+
+        ctx.fillStyle = config.border;
+        ctx.fillRect(-BRICK_WIDTH / 2, BRICK_TOP_HEIGHT - 3, BRICK_WIDTH, 3);
+
+        ctx.fillStyle = config.highlight;
+        ctx.fillRect(-BRICK_WIDTH / 2 + 4, 1, BRICK_WIDTH - 8, 2);
+
+        if (isTop) {
+          BRICK_HOLE_OFFSETS.forEach((hx, hIdx) => {
+            const isFilled = hIdx < brick.filled;
+            const holeY = 10;
+            const holeR = 6;
+
+            ctx.beginPath();
+            ctx.arc(hx, holeY, holeR, 0, Math.PI * 2);
+
+            if (isFilled) {
+              drawGlossyBall(ctx, hx, holeY, holeR, brick.color);
+            } else {
+              ctx.fillStyle = config.dark;
+              ctx.fill();
+              ctx.strokeStyle = config.border;
+              ctx.lineWidth = 1.5;
+              ctx.stroke();
+            }
+          });
+        }
+
+        ctx.restore();
+      }
+    });
+
+    ctx.restore();
+  };
+
+  const renderGridBlocks = (ctx: CanvasRenderingContext2D, grid: GridCell[][], dt: number) => {
+    ctx.save();
+
+    for (let r = 0; r < GRID_ROWS; r++) {
+      for (let c = 0; c < GRID_COLS; c++) {
+        const cell = grid[r][c];
+        if (cell.kind === 'wall' || cell.kind === 'empty') continue;
+
+        const cx = GRID_X_CENTERS[c];
+        const cy = GRID_Y_CENTERS[r] + (cell.offsetY || 0);
+
+        if (cell.offsetY && cell.offsetY < 0) {
+          cell.offsetY = Math.min(0, cell.offsetY + dt * 132);
+        }
+
+        const tappable = cell.kind === 'block' && isExposed(grid, r, c);
+
+        ctx.save();
+        ctx.translate(cx, cy);
+
+        if (cell.animState === 'pressed') {
+          ctx.scale(1.1, 0.85);
+        } else if (cell.animState === 'blocked' && cell.animTimer !== undefined) {
+          cell.animTimer += dt / 0.18;
+          const shakeX = Math.sin(cell.animTimer * Math.PI * 4) * (1 - Math.min(1.0, cell.animTimer)) * 3;
+          ctx.translate(shakeX, 0);
+          if (cell.animTimer >= 1.0) cell.animState = 'idle';
+        } else if (cell.animState === 'popBounced' && cell.animTimer !== undefined) {
+          cell.animTimer += dt / 0.25;
+          const bounceScale = 1.0 + 0.15 * Math.sin(Math.min(1.0, cell.animTimer) * Math.PI);
+          ctx.scale(bounceScale, bounceScale);
+          if (cell.animTimer >= 1.0) cell.animState = 'idle';
+        }
+
+        if (cell.kind === 'locked') {
+          const drawW = 35;
+          const drawH = 33;
+          // Locked Mystery Bucket Container
+          ctx.fillStyle = '#301850';
+          ctx.beginPath();
+          ctx.roundRect(-drawW / 2, -drawH / 2, drawW, drawH, 7);
+          ctx.fill();
+          ctx.strokeStyle = '#5E3199';
+          ctx.lineWidth = 2;
+          ctx.stroke();
+
+          // Inner mystery chamber
+          ctx.fillStyle = '#1D0C35';
+          ctx.beginPath();
+          ctx.roundRect(-drawW / 2 + 3, -drawH / 2 + 3, drawW - 6, drawH - 6, 5);
+          ctx.fill();
+
+          // Golden question mark
+          ctx.fillStyle = '#FFE382';
+          ctx.font = 'bold 16px Fredoka, sans-serif';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText('?', 0, 0);
+        } else if (cell.kind === 'dispenser') {
+          const drawW = 35;
+          const drawH = 33;
+          // Dispenser Container Body
+          ctx.fillStyle = '#261646';
+          ctx.beginPath();
+          ctx.roundRect(-drawW / 2, -drawH / 2, drawW, drawH, 7);
+          ctx.fill();
+          ctx.strokeStyle = '#F5D061';
+          ctx.lineWidth = 2;
+          ctx.stroke();
+
+          // Inner dispenser slot chamber
+          ctx.fillStyle = '#160B2C';
+          ctx.beginPath();
+          ctx.roundRect(-drawW / 2 + 3, -drawH / 2 + 3, drawW - 6, drawH - 6, 5);
+          ctx.fill();
+
+          // Counter badge number
+          ctx.fillStyle = '#FFFFFF';
+          ctx.font = 'bold 15px Fredoka, sans-serif';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(`${cell.counter || 0}`, 0, -2);
+
+          // Golden dispenser release slit at the bottom
+          ctx.fillStyle = '#FFE382';
+          ctx.fillRect(-drawW / 2 + 6, drawH / 2 - 5, drawW - 12, 3);
+        } else if (cell.kind === 'block' && cell.color) {
+          const config = COLOR_CONFIG[cell.color];
+          const drawW = 35;
+          const drawH = 33;
+
+          if (cell.animState === 'emptying' && bucketsSheetRef.current && bucketsSheetRef.current.complete) {
+            cell.animTimer = (cell.animTimer || 0) + dt;
+            const progress = Math.min(1.0, cell.animTimer / 0.26);
+            const frameIdx = Math.min(10, Math.floor(progress * 11));
+            const rowIndex = COLOR_ROW_MAP[cell.color] ?? 0;
+            const colCenterX = BUCKET_COL_CENTERS[frameIdx];
+
+            // Source crop from clean sprite sheet
+            const sx = Math.max(0, colCenterX - 64);
+            const sy = rowIndex * 128;
+            const sw = 128;
+            const sh = 128;
+
+            ctx.drawImage(
+              bucketsSheetRef.current,
+              sx,
+              sy,
+              sw,
+              sh,
+              -drawW / 2,
+              -drawH / 2,
+              drawW,
+              drawH
+            );
+
+            // Pop marbles into funnel when halfway through emptying (around frame 4-5)
+            if (cell.animTimer >= 0.12 && !cell.burstSpawned) {
+              cell.burstSpawned = true;
+              sounds.playPopBurst();
+              physicsRef.current.spawnBurst(cx, cy, cell.color, BALLS_PER_BLOCK);
+              setScore((s) => s + 50);
+            }
+
+            // Once animation completes, clear the cell and update grid
+            if (cell.animTimer >= 0.26) {
+              const tapRes = tapCell(gridRef.current, r, c);
+              if (tapRes.tapped) {
+                const changes = updateGridAfterChange(gridRef.current);
+                if (changes.revealedCells.length > 0) sounds.playTap();
+                if (changes.dispensedCells.length > 0) sounds.playPopBurst();
+              }
+            }
+          } else {
+            // Idle / active / popBounced state: render glossy bucket container
+            const bImg = bucketImgsRef.current[cell.color];
+            if (bImg && bImg.complete) {
+              // Full-color vibrant glossy bucket image
+              ctx.drawImage(bImg, -drawW / 2, -drawH / 2, drawW, drawH);
+
+              if (tappable) {
+                // Subtle bright golden outline for exposed active bucket
+                ctx.strokeStyle = '#FFE382';
+                ctx.lineWidth = 1.5;
+                ctx.beginPath();
+                ctx.roundRect(-drawW / 2 + 1, -drawH / 2 + 1, drawW - 2, drawH - 2, 7);
+                ctx.stroke();
+
+                // Sparkle dot on exposed active bucket
+                ctx.fillStyle = '#FFE382';
+                ctx.beginPath();
+                ctx.arc(drawW / 2 - 4, -drawH / 2 + 5, 2, 0, Math.PI * 2);
+                ctx.fill();
+              }
+            } else {
+              // High-fidelity fallback bucket with 9 glossy marbles
+              ctx.fillStyle = config.hex;
+              ctx.beginPath();
+              ctx.roundRect(-drawW / 2, -drawH / 2, drawW, drawH, 7);
+              ctx.fill();
+              ctx.strokeStyle = config.border;
+              ctx.lineWidth = 1.5;
+              ctx.stroke();
+
+              // Inner dark cavity
+              ctx.fillStyle = config.dark;
+              ctx.beginPath();
+              ctx.roundRect(-drawW / 2 + 3, -drawH / 2 + 3, drawW - 6, drawH - 6, 5);
+              ctx.fill();
+
+              // 9 glossy marbles in 3x3 layout
+              for (let mr = 0; mr < 3; mr++) {
+                for (let mc = 0; mc < 3; mc++) {
+                  const mx = -drawW / 2 + 7 + mc * 10;
+                  const my = -drawH / 2 + 7 + mr * 9;
+                  drawGlossyBall(ctx, mx, my, 3.5, cell.color);
+                }
+              }
+            }
+          }
+        }
+
+        ctx.restore();
+      }
+    }
+
+    ctx.restore();
+  };
+
+  const drawGlossyBall = (
+    ctx: CanvasRenderingContext2D,
+    x: number,
+    y: number,
+    radius: number,
+    color: MarbleColor,
+    scale: number = 1.0
+  ) => {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.scale(scale, scale);
+
+    const config = COLOR_CONFIG[color];
+
+    const grad = ctx.createRadialGradient(
+      -radius * 0.35,
+      -radius * 0.35,
+      radius * 0.1,
+      0,
+      0,
+      radius
+    );
+    grad.addColorStop(0, config.highlight);
+    grad.addColorStop(0.5, config.hex);
+    grad.addColorStop(1, config.dark);
+
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(0, 0, radius, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.strokeStyle = config.border;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.75)';
+    ctx.beginPath();
+    ctx.arc(-radius * 0.35, -radius * 0.35, radius * 0.28, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.restore();
+  };
+
+  const renderFunnelBalls = (ctx: CanvasRenderingContext2D, balls: { x: number; y: number; color: MarbleColor }[]) => {
+    ctx.save();
+    for (const b of balls) {
+      drawGlossyBall(ctx, b.x, b.y, BALL_RADIUS_FUNNEL, b.color);
+    }
+    ctx.restore();
+  };
+
+  const renderBeltBalls = (ctx: CanvasRenderingContext2D, balls: BeltBall[]) => {
+    ctx.save();
+    for (const b of balls) {
+      const coords = getBeltCoordinates(b.s);
+      drawGlossyBall(ctx, coords.x, coords.y, BALL_RADIUS_BELT, b.color, b.scale);
+    }
+    ctx.restore();
+  };
+
+  const renderDroppingBalls = (ctx: CanvasRenderingContext2D, droppingBalls: DroppingBall[]) => {
+    ctx.save();
+    for (const drop of droppingBalls) {
+      const t = drop.progress;
+      const currentX = drop.startX + (drop.targetX - drop.startX) * t;
+      const linearY = drop.startY + (drop.targetY - drop.startY) * t;
+      const arcHeight = -14 * Math.sin(t * Math.PI);
+      const currentY = linearY + arcHeight;
+
+      drawGlossyBall(ctx, currentX, currentY, BALL_RADIUS_BELT, drop.color, 1.0);
+    }
+    ctx.restore();
+  };
+
+  const renderParticles = (ctx: CanvasRenderingContext2D, particles: Particle[]) => {
+    ctx.save();
+    for (const p of particles) {
+      ctx.globalAlpha = p.alpha;
+      ctx.fillStyle = p.color;
+
+      if (p.shape === 'star') {
+        ctx.beginPath();
+        const r = p.size;
+        ctx.moveTo(p.x, p.y - r);
+        ctx.quadraticCurveTo(p.x, p.y, p.x + r, p.y);
+        ctx.quadraticCurveTo(p.x, p.y, p.x, p.y + r);
+        ctx.quadraticCurveTo(p.x, p.y, p.x - r, p.y);
+        ctx.quadraticCurveTo(p.x, p.y, p.x, p.y - r);
+        ctx.fill();
+      } else {
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    ctx.restore();
+  };
+
+  const renderHint = (_ctx: CanvasRenderingContext2D) => {
+    // Hint text hidden for clean royal frame aesthetic
+  };
+
+  return (
+    <div
+      ref={containerRef}
+      style={{
+        backgroundImage: `url(${bgImageSrc})`,
+        backgroundSize: '100% 100%',
+        backgroundPosition: 'center',
+      }}
+      className="relative w-full h-full flex items-center justify-center bg-[#10011E] overflow-hidden select-none font-['Fredoka']"
+    >
+      {/* 
+        Full-size Canvas:
+        Expands to 100% of the screen width and height.
+        Renders HUD, powerups, container, belt, and brick stacks at true scaled size.
+      */}
+      <canvas
+        ref={canvasRef}
+        onPointerDown={handlePointerDown}
+        onPointerUp={handlePointerUp}
+        onPointerMove={handlePointerMove}
+        onPointerLeave={() => setPauseButtonState('normal')}
+        data-testid="marble-sort-canvas"
+        className="w-full h-full touch-none cursor-pointer block"
+      />
+
+      {/* Interactive HUD Layer (Accessible, stylable in AI Studio edit panel, with dedicated element IDs) */}
+      <div
+        id="game-hud-overlay"
+        style={{
+          position: 'absolute',
+          left: `${hudTransform.offsetX}px`,
+          top: `${hudTransform.offsetY}px`,
+          width: `${BASE_WIDTH}px`,
+          height: `${BASE_HEIGHT}px`,
+          transform: `scale(${hudTransform.scale})`,
+          transformOrigin: 'top left',
+          pointerEvents: 'none',
+        }}
+        className="z-20 font-['Fredoka']"
+      >
+        {/* 1. Pause Button: Top-left red box area */}
+        <button
+          id="pause-button"
+          aria-label="Pause Game"
+          onClick={() => {
+            sounds.playTap();
+            setIsPaused(true);
+          }}
+          className="group absolute pointer-events-auto cursor-pointer select-none active:scale-90 transition-transform focus:outline-none"
+          style={{
+            top: '7px',
+            left: '18px',
+            width: '36px',
+            height: '42px',
+            marginLeft: '-35px',
+            marginRight: '0px',
+          }}
+        >
+          {/* Normal state */}
+          <img
+            src={pauseNormalImgSrc}
+            alt="Pause"
+            className="w-full h-full object-contain pointer-events-none drop-shadow block group-hover:hidden group-active:hidden"
+          />
+          {/* Hover state */}
+          <img
+            src={pauseHoverImgSrc}
+            alt="Pause Hover"
+            className="w-full h-full object-contain pointer-events-none drop-shadow hidden group-hover:block group-active:hidden"
+          />
+          {/* Pressed / Active state */}
+          <img
+            src={pausePressedImgSrc}
+            alt="Pause Pressed"
+            className="w-full h-full object-contain pointer-events-none drop-shadow hidden group-active:block"
+          />
+        </button>
+
+        {/* 2. Coin Rack UI: Top-right yellow box area */}
+        <div
+          id="coin-rack-ui"
+          aria-label="Coin Rack"
+          className="absolute pointer-events-auto flex items-center justify-center select-none cursor-pointer active:scale-95 transition-transform"
+          style={{
+            top: '7px',
+            right: '12px',
+            width: '90px',
+            height: '40px',
+            marginTop: '-1px',
+            marginRight: '-38px',
+            marginBottom: '0px',
+            marginLeft: '0px',
+            paddingTop: '0px',
+            paddingRight: '0px',
+            paddingLeft: '0px',
+          }}
+        >
+          <img
+            src={coinRackImgSrc}
+            alt="Coin Rack"
+            className="w-full h-full object-contain pointer-events-none drop-shadow"
+          />
+          <span
+            id="coin-amount"
+            className="absolute font-extrabold text-[#FFFFFF] text-[11px] tracking-wide pointer-events-none"
+            style={{
+              left: '32px',
+              right: '12px',
+              top: '9px',
+              bottom: '2px',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              textShadow: '0 1px 3px rgba(0,0,0,0.85), 0 0 4px #350170',
+              fontFamily: "'Fredoka', sans-serif",
+            }}
+          >
+            {coins.toLocaleString()}
+          </span>
+        </div>
+
+        {/* Hidden Accessible Controls for Power-ups */}
+        <div className="opacity-0 pointer-events-none">
+          <button onClick={useMagnet} className="pointer-events-auto" aria-label="Use Magnet Power-up">Magnet</button>
+          <button onClick={useShuffle} className="pointer-events-auto" aria-label="Use Shuffle Power-up">Shuffle</button>
+          <button onClick={useGumball} className="pointer-events-auto" aria-label="Use Gumball Power-up">Gumball</button>
+        </div>
+      </div>
+
+      {/* Pause Modal Overlay */}
+      {isPaused && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="Game Paused"
+          className="absolute inset-0 bg-black/65 backdrop-blur-xs flex items-center justify-center p-4 z-50 animate-fade-in"
+        >
+          <div className="bg-[#240A42] rounded-3xl p-6 border-4 border-[#F5D061] shadow-2xl flex flex-col items-center max-w-xs w-full text-center text-white">
+            <div className="w-16 h-16 mb-2 flex items-center justify-center">
+              <img src={pauseNormalImgSrc} alt="Paused" className="w-12 h-14 object-contain drop-shadow" />
+            </div>
+            <h2 className="text-3xl font-extrabold text-[#FFE382] mb-1 tracking-wider drop-shadow-md">
+              PAUSED
+            </h2>
+            <p className="text-sm text-purple-200 mb-5 font-semibold">
+              Level {currentLevel} • {coins.toLocaleString()} Coins
+            </p>
+
+            <div className="flex flex-col gap-3 w-full">
+              <button
+                onClick={() => {
+                  sounds.playTap();
+                  setIsPaused(false);
+                }}
+                className="w-full py-3.5 rounded-2xl bg-gradient-to-b from-[#2FB457] to-[#1F783A] text-white text-lg font-bold shadow-lg active:scale-95 transition-transform border border-green-300 flex items-center justify-center gap-2 cursor-pointer"
+              >
+                <span>▶</span> Resume Game
+              </button>
+
+              <button
+                onClick={() => {
+                  sounds.playTap();
+                  handleRestart();
+                  setIsPaused(false);
+                }}
+                className="w-full py-3 rounded-2xl bg-gradient-to-b from-[#7B3FE4] to-[#5821A8] hover:from-[#8B4FF4] hover:to-[#682FB8] text-white font-bold shadow active:scale-95 transition-transform border border-purple-400 flex items-center justify-center gap-2 cursor-pointer"
+              >
+                <span>🔄</span> Restart Level
+              </button>
+
+              <button
+                onClick={toggleSound}
+                className="w-full py-3 rounded-2xl bg-[#3D156E] hover:bg-[#4E1E8A] text-purple-200 font-semibold active:scale-95 transition-transform border border-purple-700/60 flex items-center justify-center gap-2 cursor-pointer"
+              >
+                <span>{soundMuted ? '🔇' : '🔊'}</span> Sound: {soundMuted ? 'OFF' : 'ON'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Win Modal Overlay */}
+      {gameState === 'won' && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="Level Won"
+          className="absolute inset-0 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 z-50 animate-fade-in"
+        >
+          <div className="bg-[#240A42] rounded-3xl p-6 border-4 border-[#FFD21F] shadow-2xl flex flex-col items-center max-w-xs w-full text-center text-white">
+            <div className="text-5xl mb-2 animate-bounce">🏆</div>
+            <h2 className="text-3xl font-extrabold text-[#FFE382] mb-1">LEVEL COMPLETE!</h2>
+            <p className="text-sm text-purple-200 mb-4 font-medium">All marbles sorted into matching bricks!</p>
+            <div className="flex items-center gap-2 mb-6 bg-[#3D156E] px-5 py-2.5 rounded-full border-2 border-[#FFD21F] shadow-inner">
+              <span className="text-2xl">🪙</span>
+              <span className="text-xl font-extrabold text-[#FFE382]">+100 Coins</span>
+            </div>
+            <div className="flex gap-3 w-full">
+              <button
+                onClick={handleRestart}
+                className="flex-1 py-3 rounded-2xl bg-purple-900/80 hover:bg-purple-800 font-bold text-purple-200 active:scale-95 transition-transform border border-purple-600 cursor-pointer"
+              >
+                Replay
+              </button>
+              <button
+                onClick={handleNextLevel}
+                className="flex-1 py-3 rounded-2xl bg-gradient-to-b from-[#2FB457] to-[#1F783A] text-white font-bold shadow-lg active:scale-95 transition-transform border border-green-300 cursor-pointer"
+              >
+                Next Level
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
